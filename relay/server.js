@@ -32,6 +32,33 @@ const rooms = new Map();
 
 // Active 6-digit pairing codes: code (string) -> pairing session metadata
 const pairingCodes = new Map();
+const MAX_PAIRING_CODES = 500;
+
+// Rate limiting for 6-digit code resolution: IP -> { count, resetAt }
+const resolveAttempts = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const entry = resolveAttempts.get(ip);
+  if (entry) {
+    if (now > entry.resetAt) {
+      resolveAttempts.delete(ip);
+      return false;
+    }
+    return entry.count >= 15;
+  }
+  return false;
+}
+
+function recordFailedAttempt(ip) {
+  const now = Date.now();
+  const entry = resolveAttempts.get(ip);
+  if (!entry || now > entry.resetAt) {
+    resolveAttempts.set(ip, { count: 1, resetAt: now + 60000 });
+  } else {
+    entry.count++;
+  }
+}
 
 function cleanExpiredPairingCodes() {
   const now = Date.now();
@@ -40,8 +67,19 @@ function cleanExpiredPairingCodes() {
       pairingCodes.delete(code);
     }
   }
+  for (const [ip, entry] of resolveAttempts.entries()) {
+    if (now > entry.resetAt) {
+      resolveAttempts.delete(ip);
+    }
+  }
 }
 setInterval(cleanExpiredPairingCodes, 10000);
+
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'SAMEORIGIN',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+};
 
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567';
 function base32Lower(buf) {
@@ -107,10 +145,14 @@ function pruneRoom(room) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const clientIp = req.headers['x-forwarded-for']
+    ? req.headers['x-forwarded-for'].split(',')[0].trim()
+    : (req.socket.remoteAddress || '127.0.0.1');
 
   // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
+      ...SECURITY_HEADERS,
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
@@ -119,19 +161,41 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Register 6-digit code
+  // Register 6-digit code (Mac -> Relay)
   if (req.method === 'POST' && url.pathname === '/api/pair/code') {
+    if (pairingCodes.size >= MAX_PAIRING_CODES) {
+      res.writeHead(503, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ status: 'error', message: 'Relay pairing registry is full. Try again shortly.' }));
+      return;
+    }
+
     let body = '';
-    req.on('data', chunk => { body += chunk; });
+    let size = 0;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > 32768) {
+        res.writeHead(413, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ status: 'error', message: 'Payload too large' }));
+        req.destroy();
+        return;
+      }
+      body += chunk;
+    });
+
     req.on('end', () => {
       try {
         const data = JSON.parse(body);
         if (!data.code || !data.deviceId || !data.sid) {
-          res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
           res.end(JSON.stringify({ status: 'error', message: 'Missing required fields' }));
           return;
         }
         const code = String(data.code).trim().replace(/[-\s]+/g, '');
+        if (!/^[0-9]{6}$/.test(code)) {
+          res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ status: 'error', message: 'Pairing code must be 6 numeric digits' }));
+          return;
+        }
         pairingCodes.set(code, {
           code,
           deviceId: data.deviceId,
@@ -143,26 +207,35 @@ const server = http.createServer((req, res) => {
           name: data.name || 'Mac',
           expiresAt: Date.now() + 125000,
         });
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify({ status: 'ok', code }));
       } catch (err) {
-        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
         res.end(JSON.stringify({ status: 'error', message: err.message }));
       }
     });
     return;
   }
 
-  // Resolve 6-digit code
+  // Resolve 6-digit code (Mobile -> Relay) with brute-force rate-limiting
   if (req.method === 'GET' && url.pathname === '/api/pair/resolve') {
+    if (isRateLimited(clientIp)) {
+      res.writeHead(429, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ status: 'error', message: 'Too many attempts. Please wait 1 minute.' }));
+      return;
+    }
+
     const code = (url.searchParams.get('code') || '').trim().replace(/[-\s]+/g, '');
     const entry = pairingCodes.get(code);
     if (!entry || (entry.expiresAt && Date.now() > entry.expiresAt)) {
-      res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      recordFailedAttempt(clientIp);
+      res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ status: 'error', message: 'Invalid or expired 6-digit code' }));
       return;
     }
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+
+    resolveAttempts.delete(clientIp);
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       status: 'ok',
       code: entry.code,
@@ -178,7 +251,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       status: 'ok',
       service: 'distee-relay',
@@ -212,6 +285,7 @@ const server = http.createServer((req, res) => {
       const ext = path.extname(filePath);
       const mime = MIME_TYPES[ext] || 'application/octet-stream';
       res.writeHead(200, {
+        ...SECURITY_HEADERS,
         'Content-Type': mime,
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': ext === '.html' || ext === '.json' ? 'no-cache' : 'public, max-age=3600',
@@ -220,11 +294,11 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain' });
   res.end('Not Found');
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: 64 * 1024 });
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -372,6 +446,10 @@ function handleDeviceConnection(ws, deviceId) {
 
 function handleMobileConnection(ws, deviceId) {
   const room = getOrCreateRoom(deviceId);
+  if (room.mobileSockets.size >= 10) {
+    ws.close(4429, 'Room mobile limit reached');
+    return;
+  }
   room.mobileSockets.add(ws);
 
   const isMacOnline = room.deviceSocket && room.deviceSocket.readyState === WebSocket.OPEN && room.authenticated;
