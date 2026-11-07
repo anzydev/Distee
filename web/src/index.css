@@ -1,0 +1,53 @@
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background-color: #090d16;
+  color: #f1f5f9;
+  -webkit-font-smoothing: antialiased;
+  -webkit-touch-callout: none;
+  user-select: none;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 9999px;
+}
+
+/* Mobile Safe Areas */
+.safe-top {
+  padding-top: max(16px, env(safe-area-inset-top));
+}
+.safe-bottom {
+  padding-bottom: max(20px, env(safe-area-inset-bottom));
+}
+
+/* Card gradients */
+.card-glass {
+  background: rgba(15, 23, 42, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.button-lock-gradient {
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  box-shadow: 0 4px 20px -2px rgba(99, 102, 241, 0.45);
+}
+
+.button-lock-gradient:active {
+  transform: scale(0.98);
+}
+

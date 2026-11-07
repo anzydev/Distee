@@ -1,0 +1,12 @@
+.DS_Store
+.distee_web_url
+
+# Swift build artifacts
+macos/.build/
+macos/build/
+
+# Node modules & build
+node_modules/
+web/node_modules/
+web/dist/
+relay/node_modules/

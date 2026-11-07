@@ -1,0 +1,333 @@
+/**
+ * Distee Zero-Cost WebSocket Relay Server
+ * 
+ * Routes end-to-end encrypted envelopes between paired Macs and Mobile clients.
+ * Zero-knowledge: the relay never holds private keys, PSKs, or decrypted messages.
+ */
+
+const http = require('http');
+const { WebSocketServer, WebSocket } = require('ws');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = parseInt(process.env.PORT || '8799', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+const WEB_DIST = path.resolve(__dirname, '../web/dist');
+
+const MIME_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+};
+
+// In-memory room registry: deviceId -> { deviceSocket, mobileSockets: Set }
+const rooms = new Map();
+
+const B32 = 'abcdefghijklmnopqrstuvwxyz234567';
+function base32Lower(buf) {
+  let bits = 0, value = 0, out = '';
+  for (const byte of buf) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+
+// Verifies the Mac's challenge response: the public key must hash to the device id
+// and the signature must cover the relay's challenge.
+function verifyDeviceAuth(deviceId, challenge, data) {
+  try {
+    if (typeof data.pk !== 'string' || typeof data.sig !== 'string' || typeof data.e !== 'number') return false;
+    const pub = Buffer.from(data.pk, 'base64url');
+    if (pub.length !== 65 || pub[0] !== 0x04) return false;
+    const derived = base32Lower(crypto.createHash('sha256').update(pub).digest()).slice(0, 16);
+    if (derived !== deviceId) return false;
+    const key = crypto.createPublicKey({
+      key: {
+        kty: 'EC',
+        crv: 'P-256',
+        x: pub.subarray(1, 33).toString('base64url'),
+        y: pub.subarray(33, 65).toString('base64url'),
+      },
+      format: 'jwk',
+    });
+    const input = Buffer.from(`distee-auth-v1\n${challenge}\n${deviceId}\n${data.e}`);
+    return crypto.verify('sha256', input, { key, dsaEncoding: 'der' }, Buffer.from(data.sig, 'base64url'));
+  } catch {
+    return false;
+  }
+}
+
+function getOrCreateRoom(deviceId) {
+  if (!rooms.has(deviceId)) {
+    rooms.set(deviceId, {
+      deviceId,
+      deviceSocket: null,
+      mobileSockets: new Set(),
+      pendingChallenge: null,
+      deviceEpoch: 0,
+      authenticated: false,
+      pending: 0,
+    });
+  }
+  return rooms.get(deviceId);
+}
+
+// Frees a room once no Mac and no phone are attached, so the registry cannot grow unbounded.
+function pruneRoom(room) {
+  if (!room.deviceSocket && room.mobileSockets.size === 0 && room.pending === 0) {
+    rooms.delete(room.deviceId);
+  }
+}
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'distee-relay',
+      activeRooms: rooms.size,
+      timestamp: Date.now(),
+    }));
+    return;
+  }
+
+  // Serve static web app from web/dist (SPA fallback to index.html)
+  if (fs.existsSync(WEB_DIST)) {
+    let decodedPath = url.pathname;
+    try {
+      decodedPath = decodeURIComponent(url.pathname);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Bad Request');
+      return;
+    }
+    let filePath = path.join(WEB_DIST, decodedPath);
+    if (!filePath.startsWith(WEB_DIST + path.sep) && filePath !== WEB_DIST) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden');
+      return;
+    }
+    if (url.pathname === '/' || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+      filePath = path.join(WEB_DIST, 'index.html');
+    }
+    if (fs.existsSync(filePath)) {
+      const ext = path.extname(filePath);
+      const mime = MIME_TYPES[ext] || 'application/octet-stream';
+      res.writeHead(200, {
+        'Content-Type': mime,
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': ext === '.html' || ext === '.json' ? 'no-cache' : 'public, max-age=3600',
+      });
+      return fs.createReadStream(filePath).pipe(res);
+    }
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not Found');
+});
+
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  // Match /ws/device/:deviceId or /ws/mobile/:deviceId
+  const deviceMatch = pathname.match(/^\/ws\/device\/([a-z0-9]{16})$/i);
+  const mobileMatch = pathname.match(/^\/ws\/mobile\/([a-z0-9]{16})$/i);
+
+  if (deviceMatch) {
+    handleDeviceConnection(ws, deviceMatch[1].toLowerCase());
+  } else if (mobileMatch) {
+    handleMobileConnection(ws, mobileMatch[1].toLowerCase());
+  } else {
+    ws.close(4404, 'Invalid WebSocket route. Use /ws/device/:id or /ws/mobile/:id');
+  }
+});
+
+function handleDeviceConnection(ws, deviceId) {
+  const room = getOrCreateRoom(deviceId);
+
+  // Registered first so the count is already decremented when the main close handler prunes.
+  room.pending++;
+  ws.once('close', () => { room.pending--; });
+
+  const challenge = crypto.randomBytes(32).toString('base64url');
+  let authenticated = false;
+  let pending = { ws, challenge };
+
+  // The new socket only replaces the current Mac after it proves it owns the device key.
+  ws.once('close', () => { pending = null; });
+
+  // Drop sockets that never complete the challenge-response.
+  const handshakeTimer = setTimeout(() => {
+    if (!authenticated) ws.close(4408, 'AUTH_TIMEOUT');
+  }, 15000);
+  ws.once('close', () => clearTimeout(handshakeTimer));
+
+  // Step 1: Send hello with challenge
+  ws.send(JSON.stringify({
+    t: 'hello',
+    challenge,
+    d: deviceId,
+    ts: Math.floor(Date.now() / 1000),
+  }));
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+
+      // Step 2: Handle authentication frame
+      if (!authenticated) {
+        if (data.t !== 'auth' || !pending || !verifyDeviceAuth(deviceId, pending.challenge, data)) {
+          ws.send(JSON.stringify({ t: 'error', reason: 'BAD_SIGNATURE' }));
+          ws.close(4403, 'BAD_SIGNATURE');
+          return;
+        }
+        authenticated = true;
+        pending = null;
+
+        if (room.deviceSocket && room.deviceSocket !== ws && room.deviceSocket.readyState === WebSocket.OPEN) {
+          room.deviceSocket.close(4409, 'Replaced by newer connection');
+        }
+        room.deviceSocket = ws;
+        room.authenticated = true;
+        room.deviceEpoch = data.e || 1;
+        room.pendingChallenge = null;
+
+        ws.send(JSON.stringify({
+          t: 'auth.ok',
+          presence: 'online',
+          ts: Math.floor(Date.now() / 1000),
+        }));
+
+        // Notify mobile clients that Mac is online
+        broadcastToMobiles(room, {
+          t: 'presence',
+          d: deviceId,
+          status: 'online',
+          ts: Math.floor(Date.now() / 1000),
+        });
+
+        console.log(`[Relay] Mac ${deviceId} authenticated (epoch ${room.deviceEpoch})`);
+        return;
+      }
+
+      // Step 3: Handle heartbeats
+      if (data.t === 'ping') {
+        ws.send(JSON.stringify({ t: 'pong', ts: Math.floor(Date.now() / 1000) }));
+        return;
+      }
+
+      // Step 4: Route outbound messages from Mac to mobile clients
+      // (e.g. pair.accept, pair.reject, lock.ack, unpair.ack)
+      broadcastToMobiles(room, data);
+    } catch (err) {
+      console.error(`[Relay] Invalid JSON from Mac ${deviceId}:`, err.message);
+    }
+  });
+
+  ws.on('close', (code, reason) => {
+    if (room.deviceSocket === ws) {
+      room.deviceSocket = null;
+      room.authenticated = false;
+      broadcastToMobiles(room, {
+        t: 'presence',
+        d: deviceId,
+        status: 'offline',
+        ts: Math.floor(Date.now() / 1000),
+      });
+      console.log(`[Relay] Mac ${deviceId} disconnected (${code})`);
+    }
+    pruneRoom(room);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[Relay] Mac ${deviceId} socket error:`, err.message);
+  });
+}
+
+function handleMobileConnection(ws, deviceId) {
+  const room = getOrCreateRoom(deviceId);
+  room.mobileSockets.add(ws);
+
+  const isMacOnline = room.deviceSocket && room.deviceSocket.readyState === WebSocket.OPEN && room.authenticated;
+
+  // Inform mobile of current Mac presence immediately
+  ws.send(JSON.stringify({
+    t: 'presence',
+    d: deviceId,
+    status: isMacOnline ? 'online' : 'offline',
+    ts: Math.floor(Date.now() / 1000),
+  }));
+
+  console.log(`[Relay] Mobile connected to room ${deviceId} (Mac is ${isMacOnline ? 'online' : 'offline'})`);
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+
+      if (data.t === 'ping') {
+        ws.send(JSON.stringify({ t: 'pong', ts: Math.floor(Date.now() / 1000) }));
+        return;
+      }
+
+      // Forward mobile command/request directly to Mac
+      if (room.deviceSocket && room.deviceSocket.readyState === WebSocket.OPEN) {
+        room.deviceSocket.send(JSON.stringify(data));
+      } else {
+        ws.send(JSON.stringify({
+          t: 'error',
+          code: 'MAC_OFFLINE',
+          message: 'Target Mac is currently offline',
+          d: deviceId,
+          ts: Math.floor(Date.now() / 1000),
+        }));
+      }
+    } catch (err) {
+      console.error(`[Relay] Invalid JSON from Mobile for ${deviceId}:`, err.message);
+    }
+  });
+
+  ws.on('close', () => {
+    room.mobileSockets.delete(ws);
+    console.log(`[Relay] Mobile disconnected from room ${deviceId}`);
+    pruneRoom(room);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[Relay] Mobile socket error for ${deviceId}:`, err.message);
+  });
+}
+
+function broadcastToMobiles(room, data) {
+  const payload = JSON.stringify(data);
+  for (const client of room.mobileSockets) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+server.listen(PORT, HOST, () => {
+  console.log(`===============================================`);
+  console.log(`  Distee Relay Server running on ws://${HOST}:${PORT}`);
+  console.log(`  Mac Endpoint:    ws://localhost:${PORT}/ws/device/:deviceId`);
+  console.log(`  Mobile Endpoint: ws://localhost:${PORT}/ws/mobile/:deviceId`);
+  console.log(`===============================================`);
+});
+

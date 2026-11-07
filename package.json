@@ -1,0 +1,13 @@
+{
+  "name": "distee-cloud",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix relay && npm install --prefix web",
+    "build": "npm install --prefix relay && npm install --prefix web && npm run build --prefix web",
+    "start": "node relay/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
