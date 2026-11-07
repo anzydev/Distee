@@ -34,38 +34,59 @@ public struct UnlockOutcome: Equatable {
 
 public protocol UnlockEventPosting {
     func wakeDisplay() -> Bool
+    func postWakePrompt() -> Bool
     func postEscape() -> Bool
     func postKeystrokes(string: String) -> Bool
     func postReturn() -> Bool
     func unlockViaSystemEvents(password: String) -> Bool
 }
 
+public extension UnlockEventPosting {
+    func postWakePrompt() -> Bool { true }
+    func postEscape() -> Bool { true }
+}
+
 public struct SystemUnlockEventPoster: UnlockEventPosting {
+    private static let spaceKeyCode: CGKeyCode = 0x31
     private static let escapeKeyCode: CGKeyCode = 0x35
     private static let returnKeyCode: CGKeyCode = 0x24
 
     public init() {}
 
     public func wakeDisplay() -> Bool {
+        // Assert user activity to turn on the screen
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        process.arguments = ["-u", "-t", "2"]
+        process.arguments = ["-u", "-t", "4"]
         try? process.run()
-        process.waitUntilExit()
 
-        // Also post a harmless Shift key event to stimulate HID
+        // Also post a key event to stimulate HID system state
+        let source = CGEventSource(stateID: .combinedSessionState)
         let shiftKey: CGKeyCode = 0x38
-        if let down = CGEvent(keyboardEventSource: nil, virtualKey: shiftKey, keyDown: true),
-           let up = CGEvent(keyboardEventSource: nil, virtualKey: shiftKey, keyDown: false) {
+        if let down = CGEvent(keyboardEventSource: source, virtualKey: shiftKey, keyDown: true),
+           let up = CGEvent(keyboardEventSource: source, virtualKey: shiftKey, keyDown: false) {
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
         }
         return true
     }
 
+    public func postWakePrompt() -> Bool {
+        // Space key dismisses the clock screensaver and displays the password box
+        let source = CGEventSource(stateID: .combinedSessionState)
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: Self.spaceKeyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: Self.spaceKeyCode, keyDown: false) else {
+            return false
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
     public func postEscape() -> Bool {
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: Self.escapeKeyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: Self.escapeKeyCode, keyDown: false) else {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: Self.escapeKeyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: Self.escapeKeyCode, keyDown: false) else {
             return false
         }
         down.post(tap: .cghidEventTap)
@@ -74,24 +95,26 @@ public struct SystemUnlockEventPoster: UnlockEventPosting {
     }
 
     public func postKeystrokes(string: String) -> Bool {
+        let source = CGEventSource(stateID: .combinedSessionState)
         for char in string.utf16 {
             var utf16Char = [char]
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
                 return false
             }
             down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &utf16Char)
             up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &utf16Char)
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
-            usleep(12_000) // 12ms between keystrokes
+            usleep(35_000) // 35ms typing delay for reliable password buffer input
         }
         return true
     }
 
     public func postReturn() -> Bool {
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: Self.returnKeyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: Self.returnKeyCode, keyDown: false) else {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: Self.returnKeyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: Self.returnKeyCode, keyDown: false) else {
             return false
         }
         down.post(tap: .cghidEventTap)
@@ -104,7 +127,9 @@ public struct SystemUnlockEventPoster: UnlockEventPosting {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         let script = "tell application \"System Events\"\n"
+            + "delay 0.5\n"
             + "keystroke \"\(escaped)\"\n"
+            + "delay 0.2\n"
             + "key code 36\n"
             + "end tell"
 
@@ -194,32 +219,47 @@ public final class MacUnlockManager {
         guard screen.isAccessibilityTrusted else {
             logger.warning("Unlock refused: Accessibility is not granted")
             screen.requestAccessibilityIfNeeded()
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            proc.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]
+            try? proc.run()
             return UnlockOutcome(
                 status: .needsPermission,
                 mechanism: .none,
                 durationMilliseconds: elapsedMilliseconds(since: start),
-                detail: "Accessibility permission is required to inject unlock keystrokes. Grant it in System Settings → Privacy & Security → Accessibility."
+                detail: "Accessibility permission is required on your Mac. Open System Settings → Privacy & Security → Accessibility and turn ON Distee."
             )
         }
 
-        // 1. Wake the display and give UI time to appear
+        // 1. Wake the display and give WindowServer time to turn on
         logger.info("Waking display for unlock")
         _ = poster.wakeDisplay()
-        await sleep(0.35)
+        await sleep(0.8)
 
-        // 2. Clear any lingering screensaver or input
-        _ = poster.postEscape()
-        await sleep(0.1)
+        // 2. Stimulate the lock screen to present and focus the password text box
+        _ = poster.postWakePrompt()
+        await sleep(0.6)
 
         // 3. Post keystrokes via native CGEvent
         logger.info("Posting unlock password via CGEvent")
-        guard poster.postKeystrokes(string: password) && poster.postReturn() else {
+        guard poster.postKeystrokes(string: password) else {
             logger.error("Failed to construct or post unlock CGEvents")
             return UnlockOutcome(
                 status: .failed,
                 mechanism: .cgEvent,
                 durationMilliseconds: elapsedMilliseconds(since: start),
                 detail: "CGEvent creation failed"
+            )
+        }
+
+        await sleep(0.1)
+        guard poster.postReturn() else {
+            logger.error("Failed to post return CGEvent")
+            return UnlockOutcome(
+                status: .failed,
+                mechanism: .cgEvent,
+                durationMilliseconds: elapsedMilliseconds(since: start),
+                detail: "CGEvent return failed"
             )
         }
 
@@ -231,7 +271,7 @@ public final class MacUnlockManager {
         // 5. Fallback attempt via System Events if CGEvent did not unlock within timeout
         logger.info("Attempting unlock fallback via System Events")
         _ = poster.unlockViaSystemEvents(password: password)
-        if let fallbackOutcome = await awaitUnlockVerification(start: start, mechanism: .systemEvents, timeout: 2.0) {
+        if let fallbackOutcome = await awaitUnlockVerification(start: start, mechanism: .systemEvents, timeout: 2.5) {
             return fallbackOutcome
         }
 

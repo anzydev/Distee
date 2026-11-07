@@ -15,6 +15,13 @@ struct MenuContent: View {
         Text("Distee — \(model.status.connection.displayName)")
         Text(pairingLine)
 
+        if !SystemScreenState().isAccessibilityTrusted {
+            Divider()
+            Button("⚠️ Enable Accessibility in Settings…") {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            }
+        }
+
         Divider()
 
         Button("Open Distee") {

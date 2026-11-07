@@ -182,7 +182,15 @@ export const MobileAppView: React.FC<MobileAppViewProps> = ({ onBackToWebsite, i
     try {
       const transport = transports.getOrCreate(mac.deviceId);
       const result = await transport.sendLockCommand(12000);
-      updateMacState(mac.deviceId, { lockResult: result, locking: false });
+      if (!result.success) {
+        updateMacState(mac.deviceId, {
+          lockResult: result,
+          locking: false,
+          error: result.message || 'Lock command failed on Mac'
+        });
+      } else {
+        updateMacState(mac.deviceId, { lockResult: result, locking: false, error: null });
+      }
     } catch (err: any) {
       updateMacState(mac.deviceId, { error: err.message || 'Lock command failed', locking: false });
     }
@@ -208,7 +216,19 @@ export const MobileAppView: React.FC<MobileAppViewProps> = ({ onBackToWebsite, i
     try {
       const transport = transports.getOrCreate(mac.deviceId);
       const result = await transport.sendUnlockCommand(pwd, 15000);
-      updateMacState(mac.deviceId, { unlockResult: result, unlocking: false });
+      if (!result.success) {
+        let msg = result.message || 'Unlock failed on Mac.';
+        if (result.status === 'NEEDS_PERMISSION') {
+          msg = '⚠️ Accessibility permission required: On your Mac, open System Settings → Privacy & Security → Accessibility and turn ON Distee.';
+        }
+        updateMacState(mac.deviceId, {
+          unlockResult: result,
+          unlocking: false,
+          error: msg
+        });
+      } else {
+        updateMacState(mac.deviceId, { unlockResult: result, unlocking: false, error: null });
+      }
       setSelectedMacForPassword(null);
       setPasswordInput('');
     } catch (err: any) {
@@ -714,12 +734,42 @@ export const MobileAppView: React.FC<MobileAppViewProps> = ({ onBackToWebsite, i
                       backgroundColor: 'rgba(158, 58, 46, 0.08)',
                       border: '1px solid var(--sketch-color-accent)',
                       borderRadius: '6px',
-                      padding: '8px 12px',
-                      fontSize: '16px',
+                      padding: '10px 12px',
+                      fontSize: '15px',
                       color: 'var(--sketch-color-accent)',
-                      marginBottom: '14px'
+                      marginBottom: '14px',
+                      lineHeight: 1.4
                     }}>
-                      {state.error}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, marginBottom: '4px' }}>
+                        <AlertCircle size={15} />
+                        <span>Unlock Notice</span>
+                      </div>
+                      <div>{state.error}</div>
+                      {hasMacUnlockPassword(mac.deviceId) && (
+                        <button
+                          onClick={() => {
+                            setMacUnlockPassword(mac.deviceId, null);
+                            setSelectedMacForPassword(mac);
+                            setPasswordInput('');
+                          }}
+                          style={{
+                            marginTop: '8px',
+                            background: 'transparent',
+                            border: '1px solid var(--sketch-color-accent)',
+                            borderRadius: '4px',
+                            color: 'var(--sketch-color-accent)',
+                            padding: '3px 8px',
+                            fontSize: '13px',
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px'
+                          }}
+                        >
+                          <KeyRound size={13} />
+                          <span>Retype Password</span>
+                        </button>
+                      )}
                     </div>
                   )}
 
