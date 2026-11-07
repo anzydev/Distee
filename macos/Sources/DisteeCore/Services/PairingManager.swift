@@ -6,6 +6,7 @@ import Foundation
 public struct PairingSession: Equatable {
     public let sessionId: String
     public let psk: Data
+    public let pairingCode: String
     public let createdAt: Date
     public let expiresAt: Date
     public let qrPayload: String
@@ -13,15 +14,34 @@ public struct PairingSession: Equatable {
     public init(
         sessionId: String,
         psk: Data,
+        pairingCode: String = "",
         createdAt: Date = Date(),
         ttlSeconds: TimeInterval = 120,
         qrPayload: String
     ) {
         self.sessionId = sessionId
         self.psk = psk
+        self.pairingCode = pairingCode.isEmpty ? Self.deriveNumericCode(psk: psk, sid: sessionId) : pairingCode
         self.createdAt = createdAt
         self.expiresAt = createdAt.addingTimeInterval(ttlSeconds)
         self.qrPayload = qrPayload
+    }
+
+    public static func deriveNumericCode(psk: Data, sid: String) -> String {
+        var hash = SHA256()
+        hash.update(data: psk)
+        hash.update(data: Data(sid.utf8))
+        let digest = hash.finalize()
+        let prefix = Array(digest.prefix(4))
+        let num = (UInt32(prefix[0]) << 24) | (UInt32(prefix[1]) << 16) | (UInt32(prefix[2]) << 8) | UInt32(prefix[3])
+        return String(format: "%06u", num % 1_000_000)
+    }
+
+    public var formattedCode: String {
+        guard pairingCode.count == 6 else { return pairingCode }
+        let first = pairingCode.prefix(3)
+        let last = pairingCode.suffix(3)
+        return "\(first) \(last)"
     }
 
     public var isExpired: Bool {
@@ -171,7 +191,7 @@ public final class PairingManager {
     }
 
     /// Resolves the base URL to encode into the pairing QR code.
-    /// Priority: explicit parameter -> DISTEE_WEB_URL env -> ~/.distee_web_url -> local LAN IP -> localhost.
+    /// Priority: explicit parameter -> DISTEE_WEB_URL env -> ~/.distee_web_url -> production cloud URL -> local LAN IP -> localhost.
     public static func resolveWebBaseURL(preferred: String? = nil, defaultPort: Int = 8799) -> String {
         if let preferred = preferred, !preferred.isEmpty {
             return preferred.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -186,10 +206,8 @@ public final class PairingManager {
                 return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             }
         }
-        if let lan = localIPAddress() {
-            return "http://\(lan):\(defaultPort)"
-        }
-        return "http://localhost:\(defaultPort)"
+        // Default to permanent production cloud web app
+        return "https://distee.onrender.com"
     }
 
     /// Initiates a new pairing session with a 120s TTL and generates the QR payload.
@@ -223,6 +241,8 @@ public final class PairingManager {
         let macEcdhPubString = Base64URL.encode(identity.keyAgreementKey.publicKey.rawRepresentation)
         let encodedName = macDisplayName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "Mac"
 
+        let code = PairingSession.deriveNumericCode(psk: psk, sid: sid)
+
         let queryParams = [
             "v=1",
             "d=\(identity.deviceId)",
@@ -231,6 +251,7 @@ public final class PairingManager {
             "sid=\(sid)",
             "k=\(pskString)",
             "exp=\(exp)",
+            "c=\(code)",
             "n=\(encodedName)"
         ].joined(separator: "&")
 
@@ -240,6 +261,7 @@ public final class PairingManager {
         let session = PairingSession(
             sessionId: sid,
             psk: psk,
+            pairingCode: code,
             ttlSeconds: 120,
             qrPayload: qrPayload
         )

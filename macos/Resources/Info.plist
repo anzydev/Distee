@@ -34,8 +34,8 @@
         <key>NSAllowsLocalNetworking</key>
         <true/>
     </dict>
-    <!-- Relay URL: defaults to local relay port 8799 -->
+    <!-- Relay URL: defaults to production cloud relay -->
     <key>DisteeRelayURL</key>
-    <string>ws://127.0.0.1:8799</string>
+    <string>wss://distee.onrender.com</string>
 </dict>
 </plist>

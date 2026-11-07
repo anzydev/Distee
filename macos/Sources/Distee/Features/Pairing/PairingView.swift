@@ -13,19 +13,20 @@ struct PairingView: View {
     @State private var errorMessage: String?
     @State private var customWebURL: String = PairingManager.resolveWebBaseURL()
     @State private var isEditingURL: Bool = false
+    @State private var showQRCode: Bool = false
 
     var body: some View {
         VStack(spacing: 18) {
             if model.status.isPaired {
                 pairedView
             } else if let session {
-                qrSessionView(session)
+                codeSessionView(session)
             } else {
                 startPairingView
             }
         }
         .padding(24)
-        .frame(minWidth: 420)
+        .frame(minWidth: 440)
         .onAppear {
             refreshState()
         }
@@ -33,15 +34,13 @@ struct PairingView: View {
             timer?.invalidate()
         }
         .onChange(of: model.status.isPaired) { isPaired in
-            // Unpairing from the menu bar or from the phone must not leave a stale, already
-            // invalid QR on screen; pairing completing must stop the countdown.
             if isPaired {
                 timer?.invalidate()
                 session = nil
                 qrImage = nil
             } else {
                 session = nil
-                generateQR()
+                generateSession()
             }
         }
     }
@@ -78,114 +77,86 @@ struct PairingView: View {
         }
     }
 
-    // MARK: - QR Display View
+    // MARK: - 6-Digit Code & Optional QR View
 
-    private func qrSessionView(_ session: PairingSession) -> some View {
-        VStack(spacing: 14) {
-            Text("Scan to Pair")
+    private func codeSessionView(_ session: PairingSession) -> some View {
+        VStack(spacing: 16) {
+            Text("Pair Mobile Device")
                 .font(.title2.weight(.semibold))
 
-            Text("Open the Distee mobile web app on your phone and scan this QR code.")
+            Text("Open the Distee web app on your phone and enter this code:")
                 .font(.callout)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
 
-            ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(Color.white)
-                    .shadow(color: .black.opacity(0.12), radius: 10, y: 4)
+            // Primary: Big 6-Digit Connection Code
+            VStack(spacing: 6) {
+                Text(session.formattedCode)
+                    .font(.system(size: 42, weight: .bold, design: .monospaced))
+                    .tracking(6)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color(nsColor: .controlBackgroundColor))
+                            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+                    )
 
-                if let qrImage {
-                    Image(nsImage: qrImage)
-                        .interpolation(.none)
-                        .resizable()
-                        .scaledToFit()
-                        .padding(16)
-                } else {
-                    ProgressView()
-                }
+                Text("distee.onrender.com")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
             }
-            .frame(width: 260, height: 260)
 
             // Timer & Expiration
             if timeRemaining > 0 {
                 HStack(spacing: 8) {
                     Image(systemName: "clock.arrow.circlepath")
                         .foregroundStyle(timeRemaining < 30 ? .red : .secondary)
-                    Text("Expires in \(timeRemaining)s")
+                    Text("Code expires in \(timeRemaining)s")
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(timeRemaining < 30 ? .red : .secondary)
                 }
             } else {
-                Text("QR Code Expired")
+                Text("Code Expired")
                     .font(.callout.weight(.medium))
                     .foregroundStyle(.red)
             }
 
-            // Target Web URL Display & Configuration
-            VStack(spacing: 6) {
-                HStack(spacing: 6) {
-                    Image(systemName: "network")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(customWebURL)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-
-                    Button {
-                        isEditingURL.toggle()
-                    } label: {
-                        Image(systemName: isEditingURL ? "chevron.up.circle.fill" : "pencil.circle")
-                            .font(.caption)
-                            .foregroundStyle(Color.accentColor)
+            // Optional QR Code Collapsible Toggle
+            VStack(spacing: 10) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showQRCode.toggle()
                     }
-                    .buttonStyle(.plain)
-                    .help("Change base URL (e.g. for tunnel or hosted web app)")
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "qrcode")
+                        Text(showQRCode ? "Hide QR Code" : "Scan QR Code Instead (Optional)")
+                        Image(systemName: showQRCode ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.subheadline.weight(.medium))
                 }
+                .buttonStyle(.link)
 
-                if isEditingURL {
-                    VStack(spacing: 6) {
-                        HStack(spacing: 6) {
-                            TextField("http://192.168.x.x:8799", text: $customWebURL)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.caption.monospaced())
+                if showQRCode {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.white)
+                            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
 
-                            Button("Apply") {
-                                isEditingURL = false
-                                generateQR()
-                            }
-                            .controlSize(.small)
-                        }
-
-                        if let lan = PairingManager.localIPAddress() {
-                            HStack {
-                                Button("Use Wi-Fi IP (:\(8799))") {
-                                    customWebURL = "http://\(lan):8799"
-                                    isEditingURL = false
-                                    generateQR()
-                                }
-                                .controlSize(.mini)
-                                .buttonStyle(.bordered)
-
-                                Button("Use Vite Dev (:\(5173))") {
-                                    customWebURL = "http://\(lan):5173"
-                                    isEditingURL = false
-                                    generateQR()
-                                }
-                                .controlSize(.mini)
-                                .buttonStyle(.bordered)
-                            }
+                        if let qrImage {
+                            Image(nsImage: qrImage)
+                                .interpolation(.none)
+                                .resizable()
+                                .scaledToFit()
+                                .padding(12)
+                        } else {
+                            ProgressView()
                         }
                     }
-                    .padding(.horizontal, 16)
+                    .frame(width: 180, height: 180)
+                    .transition(.scale.combined(with: .opacity))
                 }
-
-                Text("Phone and Mac must be on the same Wi-Fi, or use a public URL / tunnel.")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .multilineTextAlignment(.center)
             }
 
             if let error = errorMessage {
@@ -194,9 +165,9 @@ struct PairingView: View {
                     .foregroundStyle(.red)
             }
 
-            HStack(spacing: 12) {
-                Button("Regenerate QR") {
-                    generateQR()
+            HStack(spacing: 14) {
+                Button("Generate New Code") {
+                    generateSession()
                 }
                 .controlSize(.regular)
 
@@ -213,23 +184,23 @@ struct PairingView: View {
 
     private var startPairingView: some View {
         VStack(spacing: 16) {
-            Image(systemName: "qrcode.viewfinder")
+            Image(systemName: "number.square")
                 .font(.system(size: 48))
                 .foregroundStyle(Color.accentColor)
 
             Text("Pair with Mobile Phone")
                 .font(.title2.weight(.semibold))
 
-            Text("Pair your phone using a secure 120-second single-use QR code. Distee uses end-to-end encryption with no accounts or passwords.")
+            Text("Pair your phone instantly using a 6-digit code or QR code. Distee uses end-to-end encryption with zero accounts or setup.")
                 .font(.callout)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
 
             Button {
-                generateQR()
+                generateSession()
             } label: {
-                Label("Generate Pairing QR", systemImage: "qrcode")
+                Label("Generate Pairing Code", systemImage: "number")
             }
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
@@ -240,11 +211,11 @@ struct PairingView: View {
 
     private func refreshState() {
         if !model.status.isPaired && session == nil {
-            generateQR()
+            generateSession()
         }
     }
 
-    private func generateQR() {
+    private func generateSession() {
         errorMessage = nil
         timer?.invalidate()
         do {
@@ -274,7 +245,7 @@ struct PairingView: View {
         do {
             try model.service.pairingManager.unpair()
             session = nil
-            generateQR()
+            generateSession()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -294,4 +265,3 @@ struct PairingView: View {
         return nsImage
     }
 }
-

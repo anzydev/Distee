@@ -30,6 +30,19 @@ const MIME_TYPES = {
 // In-memory room registry: deviceId -> { deviceSocket, mobileSockets: Set }
 const rooms = new Map();
 
+// Active 6-digit pairing codes: code (string) -> pairing session metadata
+const pairingCodes = new Map();
+
+function cleanExpiredPairingCodes() {
+  const now = Date.now();
+  for (const [code, entry] of pairingCodes.entries()) {
+    if (entry.expiresAt && now > entry.expiresAt) {
+      pairingCodes.delete(code);
+    }
+  }
+}
+setInterval(cleanExpiredPairingCodes, 10000);
+
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567';
 function base32Lower(buf) {
   let bits = 0, value = 0, out = '';
@@ -94,12 +107,83 @@ function pruneRoom(room) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    });
+    res.end();
+    return;
+  }
+
+  // Register 6-digit code
+  if (req.method === 'POST' && url.pathname === '/api/pair/code') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        if (!data.code || !data.deviceId || !data.sid) {
+          res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ status: 'error', message: 'Missing required fields' }));
+          return;
+        }
+        const code = String(data.code).trim().replace(/[-\s]+/g, '');
+        pairingCodes.set(code, {
+          code,
+          deviceId: data.deviceId,
+          sid: data.sid,
+          pk: data.pk,
+          ek: data.ek,
+          k: data.k,
+          exp: data.exp || Math.floor((Date.now() + 120000) / 1000),
+          name: data.name || 'Mac',
+          expiresAt: Date.now() + 125000,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ status: 'ok', code }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ status: 'error', message: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Resolve 6-digit code
+  if (req.method === 'GET' && url.pathname === '/api/pair/resolve') {
+    const code = (url.searchParams.get('code') || '').trim().replace(/[-\s]+/g, '');
+    const entry = pairingCodes.get(code);
+    if (!entry || (entry.expiresAt && Date.now() > entry.expiresAt)) {
+      res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ status: 'error', message: 'Invalid or expired 6-digit code' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      code: entry.code,
+      deviceId: entry.deviceId,
+      sid: entry.sid,
+      pk: entry.pk,
+      ek: entry.ek,
+      k: entry.k,
+      exp: entry.exp,
+      name: entry.name,
+    }));
+    return;
+  }
+
   if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       status: 'ok',
       service: 'distee-relay',
       activeRooms: rooms.size,
+      activePairingCodes: pairingCodes.size,
       timestamp: Date.now(),
     }));
     return;
@@ -230,6 +314,31 @@ function handleDeviceConnection(ws, deviceId) {
       // Step 3: Handle heartbeats
       if (data.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', ts: Math.floor(Date.now() / 1000) }));
+        return;
+      }
+
+      // Step 3.5: Handle 6-digit pairing code registration
+      if (data.t === 'pair.code_register' && data.code) {
+        const code = String(data.code).trim().replace(/[-\s]+/g, '');
+        pairingCodes.set(code, {
+          code,
+          deviceId: deviceId,
+          sid: data.sid,
+          pk: data.pk,
+          ek: data.ek,
+          k: data.k,
+          exp: data.exp || Math.floor((Date.now() + 120000) / 1000),
+          name: data.name || 'Mac',
+          expiresAt: Date.now() + 125000,
+        });
+        console.log(`[Relay] Registered 6-digit code ${code} for Mac ${deviceId}`);
+        return;
+      }
+
+      if (data.t === 'pair.code_clear' && data.code) {
+        const code = String(data.code).trim().replace(/[-\s]+/g, '');
+        pairingCodes.delete(code);
+        console.log(`[Relay] Cleared 6-digit code ${code}`);
         return;
       }
 

@@ -10,3 +10,4 @@ node_modules/
 web/node_modules/
 web/dist/
 relay/node_modules/
+*.log

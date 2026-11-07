@@ -1,16 +1,57 @@
+/* ==========================================================================
+   Distee Design Systems
+   ========================================================================== */
+
 :root {
-  color-scheme: dark;
+  /* Design System 1: Professional (Website) */
+  --dp-color-ground: #f7f4ec;
+  --dp-color-surface: #fcfaf5;
+  --dp-color-ink: #29271f;
+  --dp-color-ink-muted: #514d44;
+  --dp-color-accent: #8b713a;
+  --dp-color-accent-ink: #68501f;
+  --dp-color-line: #d4ccbd;
+  --dp-color-band-edge: #e7e0d3;
+  --dp-color-action-hover: #454034;
+  --dp-typography-display: "EB Garamond", "Professional Garamond", Georgia, serif;
+  --dp-typography-reading: "Instrument Sans", "Professional Instrument", -apple-system, sans-serif;
+  --dp-typography-supporting: 15px;
+  --dp-typography-metadata: 12px;
+  --dp-typography-body-leading: 1.65;
+  --dp-spacing-control-gap: 24px;
+  --dp-radius-corner: 3px;
+  --dp-border-hairline: 1px;
+  --dp-motion-interaction: 160ms linear;
+
+  /* Design System 2: Sketch (Mobile Web App) */
+  --sketch-color-ground: #f7f2e7;
+  --sketch-color-ink: #38352f;
+  --sketch-color-ink-muted: #514d44;
+  --sketch-color-line: #b3ac9d;
+  --sketch-color-accent: #9e3a2e;
+  --sketch-color-annotation: #344c69;
+  --sketch-color-highlight: #f0dfa0;
+  --sketch-color-scrap: #fcf8ef;
+  --sketch-typography-reading-face: "Patrick Hand", "Kalam", cursive;
+  --sketch-typography-display-face: "Kalam", "Patrick Hand", cursive;
+  --sketch-typography-body: 22px;
+  --sketch-typography-reading: 20px;
+  --sketch-typography-detail: 17px;
+  --sketch-spacing-item-gap: 16px;
+  --sketch-radius-control: 9px 4px 17px 5px / 4px 12px 5px 9px;
+  --sketch-border-fine-stroke: 1.5px;
+  --sketch-motion-control: 100ms ease;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
   margin: 0;
   padding: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  background-color: #090d16;
-  color: #f1f5f9;
   -webkit-font-smoothing: antialiased;
-  -webkit-touch-callout: none;
-  user-select: none;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 /* Custom Scrollbar */
@@ -22,11 +63,11 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background: #c8bead;
   border-radius: 9999px;
 }
 
-/* Mobile Safe Areas */
+/* Safe areas */
 .safe-top {
   padding-top: max(16px, env(safe-area-inset-top));
 }
@@ -34,20 +75,12 @@ body {
   padding-bottom: max(20px, env(safe-area-inset-bottom));
 }
 
-/* Card gradients */
-.card-glass {
-  background: rgba(15, 23, 42, 0.75);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
-.button-lock-gradient {
-  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-  box-shadow: 0 4px 20px -2px rgba(99, 102, 241, 0.45);
+@keyframes pulseFade {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
-
-.button-lock-gradient:active {
-  transform: scale(0.98);
-}
-

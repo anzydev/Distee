@@ -55,9 +55,13 @@ public final class BackgroundService {
         self.unlockManager = unlockManager ?? MacUnlockManager(logger: logger, clock: clock)
         self.pairingManager = PairingManager(store: pairingStore, security: security, logger: logger)
 
-        self.pairingManager.onStateChange = { [weak self] _ in
-            self?.refreshPairing()
-            self?.publishStatus()
+        self.pairingManager.onStateChange = { [weak self] state in
+            guard let self else { return }
+            if case .pairingAvailable(let session) = state, let identity = self.identity {
+                self.registerPairingCode(session: session, identity: identity)
+            }
+            self.refreshPairing()
+            self.publishStatus()
         }
 
         status.isDevelopmentRelay = configuration.isDevelopmentRelay
@@ -303,6 +307,35 @@ public final class BackgroundService {
             handleUnpairCommandFrame(json)
         default:
             logger.debug("Ignored unhandled frame type: \(type)")
+        }
+    }
+
+    private func registerPairingCode(session: PairingSession, identity: DeviceIdentity) {
+        let frame: [String: Any] = [
+            "t": "pair.code_register",
+            "code": session.pairingCode,
+            "deviceId": identity.deviceId,
+            "sid": session.sessionId,
+            "pk": Base64URL.encode(identity.signingPublicKey.rawRepresentation),
+            "ek": Base64URL.encode(identity.keyAgreementKey.publicKey.rawRepresentation),
+            "k": Base64URL.encode(session.psk),
+            "exp": Int(session.expiresAt.timeIntervalSince1970),
+            "name": Host.current().localizedName ?? "Mac"
+        ]
+        sendFrame(frame)
+
+        if let relayURL = configuration.relayURL {
+            let httpURL = relayURL.absoluteString
+                .replacingOccurrences(of: "wss://", with: "https://")
+                .replacingOccurrences(of: "ws://", with: "http://")
+            if let endpoint = URL(string: "\(httpURL)/api/pair/code"),
+               let body = try? JSONSerialization.data(withJSONObject: frame) {
+                var request = URLRequest(url: endpoint)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = body
+                URLSession.shared.dataTask(with: request).resume()
+            }
         }
     }
 

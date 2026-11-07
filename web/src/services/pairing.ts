@@ -67,6 +67,39 @@ export function parseQRPayload(raw: string): QRPayload {
   };
 }
 
+/**
+ * Resolves a 6-digit pairing code from the relay server.
+ */
+export async function resolvePairingCode(code: string): Promise<QRPayload> {
+  const cleanCode = code.trim().replace(/[-\s]+/g, '');
+  if (cleanCode.length !== 6) {
+    throw new Error('Please enter a valid 6-digit code');
+  }
+
+  const relayWs = getRelayUrl();
+  const httpBase = relayWs
+    .replace(/^wss:\/\//i, 'https://')
+    .replace(/^ws:\/\//i, 'http://');
+
+  const res = await fetch(`${httpBase}/api/pair/resolve?code=${encodeURIComponent(cleanCode)}`);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || 'Invalid or expired 6-digit code. Check your Mac screen.');
+  }
+
+  const data = await res.json();
+  return {
+    v: 1,
+    deviceId: data.deviceId.toLowerCase(),
+    macSignPub: data.pk,
+    macEcdhPub: data.ek,
+    sessionId: data.sid,
+    psk: base64UrlDecode(data.k),
+    expiresAt: data.exp,
+    name: data.name || 'Mac',
+  };
+}
+
 export interface PairingResult {
   mac: PairedMac;
   confCode: string;
