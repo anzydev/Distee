@@ -40,7 +40,7 @@ const resolveAttempts = new Map();
 // Password-gated "Lock All" for the hackathon test panel. The default password lives here
 // only (never in the web bundle); rotate it by editing this line or by setting
 // DISTEE_TEST_PASSWORD in the environment.
-const TEST_PASSWORD = process.env.DISTEE_TEST_PASSWORD || '9fh40f(&G(oub)';
+const TEST_PASSWORD = process.env.DISTEE_TEST_PASSWORD || '12345678';
 const TEST_MAX_ATTEMPTS = 10;
 const TEST_WINDOW_MS = 60000;
 
