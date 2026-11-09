@@ -11,11 +11,47 @@ import { getRelayUrl } from '../storage/storage';
  * so judges can lock demo Macs without pairing a phone.
  */
 
-function getRelayHttpBase(): string {
-  return getRelayUrl()
+function wsToHttp(base: string): string {
+  return base
     .replace(/^wss:\/\//i, 'https://')
     .replace(/^ws:\/\//i, 'http://')
     .replace(/\/+$/, '');
+}
+
+function getRelayHttpBase(): string {
+  return wsToHttp(getRelayUrl());
+}
+
+function hostLabel(base: string): string {
+  return base.replace(/^https?:\/\//, '');
+}
+
+/**
+ * The relay serving this page plus the central fleet relay advertised by /health.
+ *
+ * Macs register with the fleet relay in addition to their primary relay, so a panel served
+ * from a local/tunnel relay can still count and lock Macs that are attached elsewhere.
+ */
+async function discoverFleetBase(primaryBase: string): Promise<string | null> {
+  try {
+    const override = localStorage.getItem('distee_fleet_relay_url');
+    if (override) {
+      const base = wsToHttp(override);
+      return base.toLowerCase() === primaryBase.toLowerCase() ? null : base;
+    }
+  } catch {}
+
+  try {
+    const res = await fetch(`${primaryBase}/health`, { cache: 'no-store' });
+    if (res.ok) {
+      const data = (await res.json()) as { fleet?: unknown };
+      if (typeof data.fleet === 'string' && data.fleet) {
+        const base = wsToHttp(data.fleet);
+        if (base.toLowerCase() !== primaryBase.toLowerCase()) return base;
+      }
+    }
+  } catch {}
+  return null;
 }
 
 interface TestDeviceResult {
@@ -190,10 +226,11 @@ function isLockedStatus(status: string): boolean {
 }
 
 async function postTest(
+  base: string,
   path: string,
   password: string
 ): Promise<{ ok: boolean; httpStatus: number; data: TestResponse; staleRelay: boolean }> {
-  const res = await fetch(`${getRelayHttpBase()}${path}`, {
+  const res = await fetch(`${base}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password }),
@@ -214,12 +251,28 @@ export const TestPanel: React.FC = () => {
   const [locking, setLocking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
-  const [relayBase] = useState(getRelayHttpBase);
+  const [primaryBase] = useState(getRelayHttpBase);
+  const [fleetBase, setFleetBase] = useState<string | null>(null);
   const [online, setOnline] = useState<number | null>(null);
   const [results, setResults] = useState<TestDeviceResult[] | null>(null);
   // Invalidates in-flight requests when the panel is closed or reopened, so a late response
   // cannot reopen the panel or overwrite a newer attempt.
   const requestIdRef = useRef(0);
+
+  const relayBase = fleetBase ?? primaryBase;
+  const relayBases = fleetBase ? [fleetBase, primaryBase] : [primaryBase];
+
+  // Ask the serving relay where the fleet relay lives. The fleet connection is what lets
+  // this panel see Macs that registered against a different primary relay.
+  useEffect(() => {
+    let cancelled = false;
+    void discoverFleetBase(primaryBase).then((base) => {
+      if (!cancelled) setFleetBase(base);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [primaryBase]);
 
   const close = () => {
     requestIdRef.current += 1;
@@ -253,21 +306,28 @@ export const TestPanel: React.FC = () => {
     setResults(null);
   };
 
-  // While the panel is open, keep showing how many Macs are attached to the relay the panel
-  // is talking to. A zero count is the quickest way to spot the panel/agent mismatch.
+  // While the panel is open, keep showing how many Macs are attached to the relays the
+  // panel can reach (fleet + local), deduplicated by device id. A zero count is the
+  // quickest way to spot the panel/agent mismatch.
   useEffect(() => {
     if (stage !== 'panel') return;
     let cancelled = false;
 
     const refreshStatus = async () => {
-      try {
-        const { ok, data } = await postTest('/api/test/status', password);
-        if (!cancelled && ok && data.status === 'ok') {
-          setOnline(data.online ?? 0);
+      const seen = new Set<string>();
+      let reachable = false;
+      for (const base of relayBases) {
+        try {
+          const { ok, data } = await postTest(base, '/api/test/status', password);
+          if (ok && data.status === 'ok') {
+            reachable = true;
+            for (const device of data.devices ?? []) seen.add(device.id);
+          }
+        } catch {
+          // Polling is best-effort; the lock button still works.
         }
-      } catch {
-        // Polling is best-effort; the lock button still works.
       }
+      if (!cancelled && reachable) setOnline(seen.size);
     };
 
     void refreshStatus();
@@ -276,7 +336,9 @@ export const TestPanel: React.FC = () => {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [stage, password]);
+    // relayBases is derived from fleetBase/primaryBase below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, password, primaryBase, fleetBase]);
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -285,26 +347,50 @@ export const TestPanel: React.FC = () => {
     const requestId = ++requestIdRef.current;
     setChecking(true);
     setError(null);
-    try {
-      const { ok, httpStatus, data, staleRelay } = await postTest('/api/test/auth', password);
-      if (requestId !== requestIdRef.current) return;
-      if (staleRelay) {
+
+    let authed = false;
+    let sawStale = false;
+    let lastStatus = 0;
+    let lastMessage: string | undefined;
+    let reachedAny = false;
+
+    for (const base of [primaryBase, ...(fleetBase ? [fleetBase] : [])]) {
+      try {
+        const { ok, httpStatus, data, staleRelay } = await postTest(base, '/api/test/auth', password);
+        if (staleRelay) {
+          sawStale = true;
+          continue;
+        }
+        reachedAny = true;
+        if (ok) {
+          authed = true;
+          break;
+        }
+        lastStatus = httpStatus;
+        lastMessage = data.message;
+        if (httpStatus === 401 || httpStatus === 429) break;
+      } catch {
+        // Try the next relay.
+      }
+    }
+
+    if (requestId === requestIdRef.current) {
+      if (authed) {
+        setStage('panel');
+      } else if (!reachedAny && sawStale) {
         setError(
           `The relay at ${relayBase} is running an older build without the test panel. Restart it (./start.sh) or redeploy it.`
         );
-      } else if (ok) {
-        setStage('panel');
-      } else if (httpStatus === 429) {
+      } else if (lastStatus === 429) {
         setError('Too many attempts. Wait a minute and try again.');
-      } else {
-        setError(data.message || 'Incorrect test password');
-      }
-    } catch {
-      if (requestId === requestIdRef.current) {
+      } else if (lastStatus === 401) {
+        setError(lastMessage || 'Incorrect test password');
+      } else if (!reachedAny) {
         setError(`Could not reach the relay at ${relayBase}. Check your connection.`);
+      } else {
+        setError(lastMessage || 'Could not verify the test password. Try again.');
       }
-    } finally {
-      if (requestId === requestIdRef.current) setChecking(false);
+      setChecking(false);
     }
   };
 
@@ -316,22 +402,74 @@ export const TestPanel: React.FC = () => {
     setError(null);
     setResult(null);
     setResults(null);
+
+    // Ask every reachable relay (fleet first, then the one serving this page) so Macs on
+    // different primary relays are all locked. Results are merged per device id.
+    const merged = new Map<string, TestDeviceResult>();
+    let anyOk = false;
+    let reachedAny = false;
+    let sawUnauthorized = false;
+    let sawRateLimited = false;
+    let legacySent = 0;
+    let lastMessage: string | undefined;
+
     try {
-      const { ok, httpStatus, data, staleRelay } = await postTest('/api/test/lock-all', password);
+      await Promise.all(
+        relayBases.map(async (base) => {
+          try {
+            const { ok, httpStatus, data, staleRelay } = await postTest(
+              base,
+              '/api/test/lock-all',
+              password
+            );
+            if (staleRelay) return;
+            reachedAny = true;
+            if (ok && data.status === 'ok') {
+              anyOk = true;
+              if (Array.isArray(data.results)) {
+                for (const device of data.results) {
+                  const existing = merged.get(device.id);
+                  if (
+                    !existing ||
+                    (!isLockedStatus(existing.status) && isLockedStatus(device.status))
+                  ) {
+                    merged.set(device.id, device);
+                  }
+                }
+              } else if (typeof data.sent === 'number') {
+                legacySent = Math.max(legacySent, data.sent);
+              }
+            } else if (httpStatus === 401) {
+              sawUnauthorized = true;
+            } else if (httpStatus === 429) {
+              sawRateLimited = true;
+            } else {
+              lastMessage = data.message;
+            }
+          } catch {
+            // The other relay may still be reachable.
+          }
+        })
+      );
+
       if (requestId !== requestIdRef.current) return;
-      if (staleRelay) {
+
+      if (!reachedAny) {
         setError(
           `The relay at ${relayBase} is running an older build without the test panel. Restart it (./start.sh) or redeploy it.`
         );
-      } else if (ok && data.status === 'ok') {
-        const sent = data.sent ?? 0;
-        const locked = data.locked ?? 0;
-        setResults(data.results ?? null);
+      } else if (anyOk) {
+        const unique = Array.from(merged.values());
+        const sent = unique.length + (unique.length > 0 ? legacySent : 0);
+        const locked = unique.filter((device) => isLockedStatus(device.status)).length;
+        setResults(unique.length > 0 ? unique : null);
         setOnline(sent);
         if (sent === 0) {
           setResult(
-            `No Macs are connected to this relay (${relayBase}). Start Distee against the same relay and try again.`
+            `No Macs are connected to the reachable relays (${relayBase}). Start Distee against the same relay and try again.`
           );
+        } else if (unique.length === 0) {
+          setResult(`Lock signal sent to ${sent} Mac${sent === 1 ? '' : 's'}.`);
         } else if (locked === sent) {
           setResult(`Locked ${locked} of ${sent} Mac${sent === 1 ? '' : 's'}.`);
         } else {
@@ -340,13 +478,13 @@ export const TestPanel: React.FC = () => {
               'Check that Distee has Accessibility permission (or "require password immediately" for display sleep).'
           );
         }
-      } else if (httpStatus === 401) {
+      } else if (sawUnauthorized) {
         setStage('password');
         setError('Session rejected. Enter the test password again.');
-      } else if (httpStatus === 429) {
+      } else if (sawRateLimited) {
         setError('Too many attempts. Wait a minute and try again.');
       } else {
-        setError(data.message || 'Could not lock the Macs. Try again.');
+        setError(lastMessage || 'Could not lock the Macs. Try again.');
       }
     } catch {
       if (requestId === requestIdRef.current) {
@@ -445,11 +583,14 @@ export const TestPanel: React.FC = () => {
                 </div>
 
                 <p style={{ margin: '0 0 14px', fontSize: '13px', lineHeight: 1.5, color: '#94a3b8' }}>
-                  Locks every Mac currently connected to the relay. No pairing is required.
+                  Locks every Mac registered with the fleet relay, plus any Mac connected
+                  directly to this relay. No pairing is required.
                 </p>
 
                 <div style={metaRowStyle}>
-                  <span style={{ wordBreak: 'break-all' }}>{relayBase}</span>
+                  <span style={{ wordBreak: 'break-all' }}>
+                    {fleetBase ? `Fleet: ${hostLabel(fleetBase)}` : hostLabel(primaryBase)}
+                  </span>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', whiteSpace: 'nowrap' }}>
                     <span
                       style={{

@@ -20,6 +20,7 @@ public final class BackgroundService {
     public let pairingManager: PairingManager
 
     private var connection: ConnectionManager?
+    private var fleetConnection: ConnectionManager?
     private var identity: DeviceIdentity?
     private var wakeObserver: NSObjectProtocol?
     private var statusLock = NSLock()
@@ -105,6 +106,7 @@ public final class BackgroundService {
 
         refreshPairing()
         startConnection()
+        startFleetConnection()
         observeEnvironment()
         refreshLaunchAtLogin()
         publishStatus()
@@ -114,6 +116,8 @@ public final class BackgroundService {
         logger.notice("Distee agent stopping")
         connection?.stop()
         connection = nil
+        fleetConnection?.stop()
+        fleetConnection = nil
         networkMonitor.stop()
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
@@ -130,9 +134,12 @@ public final class BackgroundService {
     public func stopSynchronously(timeout: TimeInterval = 2) {
         let semaphore = DispatchSemaphore(value: 0)
         let manager = connection
+        let fleet = fleetConnection
         connection = nil
+        fleetConnection = nil
         DispatchQueue.global(qos: .utility).async {
             manager?.stop()
+            fleet?.stop()
             semaphore.signal()
         }
         _ = semaphore.wait(timeout: .now() + timeout)
@@ -270,6 +277,54 @@ public final class BackgroundService {
         manager.start()
     }
 
+    /// Registers this Mac with the central fleet relay as well as its primary relay.
+    ///
+    /// The primary relay is chosen per deployment (local tunnel, Render, self-hosted), so two
+    /// Macs can easily end up on different relays. The fleet connection gives the password-
+    /// gated panel one place to count every running agent and to fan out `test.lock`.
+    private func startFleetConnection() {
+        guard let identity, let fleetURL = configuration.fleetDeviceURL(deviceId: identity.deviceId) else {
+            return
+        }
+        if let primary = configuration.deviceURL(deviceId: identity.deviceId), primary == fleetURL {
+            return
+        }
+
+        let authenticator = RelayAuthenticator(
+            deviceId: identity.deviceId,
+            epoch: pairingStore.currentEpoch,
+            signer: identity.signer
+        )
+        let manager = ConnectionManager(
+            options: ConnectionManager.Options(url: fleetURL),
+            authenticator: authenticator,
+            logger: logger,
+            clock: clock
+        )
+        manager.onStateChange = { [weak self] state in
+            self?.logger.info("Fleet relay \(state.displayName, privacy: .public)")
+        }
+        manager.onMessage = { [weak self, weak manager] data in
+            guard let self, let manager else { return }
+            self.handleFleetInboundMessage(data, via: manager)
+        }
+        fleetConnection = manager
+        manager.start()
+        logger.notice("Fleet relay connection starting at \(fleetURL.absoluteString, privacy: .public)")
+    }
+
+    /// Only fleet-control frames are accepted on the fleet connection; pairing and command
+    /// traffic stays on the primary relay.
+    private func handleFleetInboundMessage(_ data: Data, via manager: ConnectionManager) {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let type = json["t"] as? String else {
+            return
+        }
+        if type == "test.lock" {
+            handleTestLockFrame(json, replyVia: manager)
+        }
+    }
+
     /// Test seam: observes every frame the service emits, in addition to sending it.
     public var onOutboundFrame: (([String: Any]) -> Void)?
 
@@ -279,11 +334,12 @@ public final class BackgroundService {
         handleInboundMessage(data)
     }
 
-    public func sendFrame(_ frame: [String: Any]) {
+    public func sendFrame(_ frame: [String: Any], via manager: ConnectionManager? = nil) {
         onOutboundFrame?(frame)
         guard let data = try? JSONSerialization.data(withJSONObject: frame) else { return }
+        let target = manager ?? connection
         Task {
-            try? await connection?.send(data)
+            try? await target?.send(data)
         }
     }
 
@@ -603,9 +659,12 @@ public final class BackgroundService {
     /// and only emits this frame from its own password-protected endpoint, while the
     /// WebSocket carrying it is already authenticated as this Mac.
     ///
-    /// The Mac answers with an unsigned `test.lock.ack` so the panel can report whether the
-    /// screen actually locked instead of only knowing the signal was sent.
-    private func handleTestLockFrame(_ json: [String: Any]) {
+    /// The Mac answers with an unsigned `test.lock.ack` on the same connection so the panel
+    /// can report whether the screen actually locked, not just that the signal was sent.
+    private func handleTestLockFrame(
+        _ json: [String: Any],
+        replyVia manager: ConnectionManager? = nil
+    ) {
         guard json["t"] as? String == "test.lock" else { return }
         if let target = json["d"] as? String, let identity, target != identity.deviceId {
             logger.warning("Ignoring test.lock addressed to \(target, privacy: .public)")
@@ -631,7 +690,7 @@ public final class BackgroundService {
             ]
             if let deviceId = self.identity?.deviceId { ack["d"] = deviceId }
             if let detail = outcome.detail { ack["detail"] = detail }
-            self.sendFrame(ack)
+            self.sendFrame(ack, via: manager)
         }
     }
 
@@ -738,6 +797,7 @@ public final class BackgroundService {
             self.logger.info("Network path \(satisfied ? "available" : "unavailable", privacy: .public)")
             if satisfied {
                 self.connection?.reconnectImmediately(reason: "network path available")
+                self.fleetConnection?.reconnectImmediately(reason: "network path available")
             }
         }
         networkMonitor.start()
@@ -749,6 +809,7 @@ public final class BackgroundService {
         ) { [weak self] _ in
             self?.logger.info("System wake detected; reconnecting")
             self?.connection?.reconnectImmediately(reason: "system wake")
+            self?.fleetConnection?.reconnectImmediately(reason: "system wake")
         }
     }
 

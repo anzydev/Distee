@@ -37,5 +37,9 @@
     <!-- Relay URL: defaults to production cloud relay -->
     <key>DisteeRelayURL</key>
     <string>wss://distee.onrender.com</string>
+    <!-- Fleet relay: every Mac registers here too, so the admin panel can count and
+         lock the whole fleet even when agents use different primary relays. -->
+    <key>DisteeFleetRelayURL</key>
+    <string>wss://distee.onrender.com</string>
 </dict>
 </plist>

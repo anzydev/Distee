@@ -45,6 +45,10 @@ const TEST_MAX_ATTEMPTS = 10;
 const TEST_WINDOW_MS = 60000;
 const TEST_LOCK_ACK_TIMEOUT_MS = 3000;
 
+// Central relay every Mac also registers with, so the test panel can count and lock the
+// whole fleet even when agents use different primary relays. Advertised via /health.
+const FLEET_RELAY_URL = process.env.DISTEE_FLEET_RELAY || 'wss://distee.onrender.com';
+
 if (!process.env.DISTEE_TEST_PASSWORD) {
   console.warn('[Relay] DISTEE_TEST_PASSWORD is not set; using the built-in demo password');
 }
@@ -495,6 +499,7 @@ const server = http.createServer((req, res) => {
       service: 'distee-relay',
       activeRooms: rooms.size,
       activePairingCodes: pairingCodes.size,
+      fleet: FLEET_RELAY_URL,
       timestamp: Date.now(),
     }));
     return;
