@@ -596,21 +596,42 @@ public final class BackgroundService {
         }
     }
 
-    /// Locks on behalf of the relay's password-gated test panel.
+    /// Locks on behalf of the relay's password-gated test/emergency panel.
     ///
-    /// Deliberately has no signature or pairing check: hackathon judges must be able to lock
-    /// a demo Mac without pairing a phone. The relay never forwards `test.*` frames from
-    /// mobile clients and only emits this frame from its own password-protected endpoint, so
-    /// the ability to trigger it is limited to holders of the relay test password.
+    /// Deliberately has no signature or pairing check: judges must be able to lock a demo Mac
+    /// without pairing a phone. The relay never forwards `test.*` frames from mobile clients
+    /// and only emits this frame from its own password-protected endpoint, while the
+    /// WebSocket carrying it is already authenticated as this Mac.
+    ///
+    /// The Mac answers with an unsigned `test.lock.ack` so the panel can report whether the
+    /// screen actually locked instead of only knowing the signal was sent.
     private func handleTestLockFrame(_ json: [String: Any]) {
         guard json["t"] as? String == "test.lock" else { return }
-        logger.notice("Test lock requested by relay")
+        if let target = json["d"] as? String, let identity, target != identity.deviceId {
+            logger.warning("Ignoring test.lock addressed to \(target, privacy: .public)")
+            return
+        }
+        let requestId = (json["id"] as? String) ?? ULID.generate()
+        logger.notice("Relay fleet lock requested (id \(requestId, privacy: .public))")
+
         Task { [weak self] in
             guard let self else { return }
             let outcome = await self.performLockNow()
             self.logger.notice(
-                "Test lock result \(outcome.status.rawValue, privacy: .public) via \(outcome.mechanism.rawValue, privacy: .public)"
+                "Fleet lock result \(outcome.status.rawValue, privacy: .public) via \(outcome.mechanism.rawValue, privacy: .public)"
             )
+            var ack: [String: Any] = [
+                "v": 1,
+                "t": "test.lock.ack",
+                "id": requestId,
+                "status": outcome.status.rawValue,
+                "mechanism": outcome.mechanism.rawValue,
+                "durationMs": outcome.durationMilliseconds,
+                "ts": Int(self.clock.now.timeIntervalSince1970)
+            ]
+            if let deviceId = self.identity?.deviceId { ack["d"] = deviceId }
+            if let detail = outcome.detail { ack["detail"] = detail }
+            self.sendFrame(ack)
         }
     }
 

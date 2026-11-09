@@ -59,6 +59,19 @@ else
 fi
 
 echo "  💻 Mac Local Relay: ws://127.0.0.1:8799"
+
+# 5. Start the macOS agent against THIS relay. The password-gated Test panel can only see
+#    Macs attached to the relay that serves the page, so keeping both on ws://127.0.0.1:8799
+#    makes "Lock All" work without any pairing. Set DISTEE_NO_AGENT=1 to skip this.
+if [ "${DISTEE_NO_AGENT:-0}" != "1" ] && [ -d "$ROOT_DIR/macos/build/Distee.app" ]; then
+    pkill -f "Distee.app/Contents/MacOS/Distee" 2>/dev/null || true
+    sleep 0.5
+    open "$ROOT_DIR/macos/build/Distee.app" --args --dev-relay ws://127.0.0.1:8799
+    echo "  🖥️  Distee agent started on ws://127.0.0.1:8799"
+else
+    echo "  🖥️  Start the agent: open macos/build/Distee.app --args --dev-relay ws://127.0.0.1:8799"
+fi
+
 echo "  🛑 To stop services: ./stop.sh"
 echo "=========================================================="
 echo "  Distee background services are live!"

@@ -43,9 +43,17 @@ const resolveAttempts = new Map();
 const TEST_PASSWORD = process.env.DISTEE_TEST_PASSWORD || '12345678';
 const TEST_MAX_ATTEMPTS = 10;
 const TEST_WINDOW_MS = 60000;
+const TEST_LOCK_ACK_TIMEOUT_MS = 3000;
+
+if (!process.env.DISTEE_TEST_PASSWORD) {
+  console.warn('[Relay] DISTEE_TEST_PASSWORD is not set; using the built-in demo password');
+}
 
 // Failed test-panel attempts: IP -> { count, resetAt }
 const testAttempts = new Map();
+
+// In-flight fleet-lock requests awaiting `test.lock.ack` frames: id -> waiter
+const testLockRequests = new Map();
 
 function isRateLimited(ip) {
   const now = Date.now();
@@ -129,8 +137,33 @@ function sendJson(res, status, payload) {
     ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-store',
   });
   res.end(JSON.stringify(payload));
+}
+
+function isRoomOnline(room) {
+  return Boolean(
+    room.deviceSocket &&
+    room.authenticated &&
+    room.deviceSocket.readyState === WebSocket.OPEN
+  );
+}
+
+// Collects a Mac's `test.lock.ack` for the HTTP request that triggered the fleet lock.
+function noteTestLockAck(deviceId, data) {
+  const waiter = testLockRequests.get(data.id);
+  if (!waiter) return false;
+  waiter.results.set(deviceId, {
+    status: typeof data.status === 'string' ? data.status : 'UNKNOWN',
+    mechanism: typeof data.mechanism === 'string' ? data.mechanism : 'none',
+    durationMs: Number.isFinite(data.durationMs) ? data.durationMs : null,
+    detail: typeof data.detail === 'string' ? data.detail : undefined,
+  });
+  if (waiter.results.size >= waiter.expected.size) {
+    waiter.resolve('complete');
+  }
+  return true;
 }
 
 function readJsonBody(req, res, limit, done) {
@@ -349,9 +382,9 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Locks every Mac currently authenticated with the relay. The Mac agent handles this
-  // frame without requiring a pairing record, which is what makes judge testing possible.
-  if (req.method === 'POST' && url.pathname === '/api/test/lock-all') {
+  // Reports which Macs are currently authenticated with this relay, so the panel can show
+  // whether "Lock All" will reach anything (and which relay it is talking to).
+  if (req.method === 'POST' && url.pathname === '/api/test/status') {
     if (isTestRateLimited(clientIp)) {
       sendJson(res, 429, { status: 'error', message: 'Too many attempts. Wait a minute and try again.' });
       return;
@@ -364,19 +397,93 @@ const server = http.createServer((req, res) => {
       }
       testAttempts.delete(clientIp);
 
-      const ts = Math.floor(Date.now() / 1000);
-      let sent = 0;
+      const devices = [];
       for (const room of rooms.values()) {
-        const socket = room.deviceSocket;
-        if (socket && room.authenticated && socket.readyState === WebSocket.OPEN) {
-          try {
-            socket.send(JSON.stringify({ t: 'test.lock', d: room.deviceId, ts }));
-            sent += 1;
-          } catch {}
+        if (isRoomOnline(room)) {
+          devices.push({ id: room.deviceId, epoch: room.deviceEpoch });
         }
       }
-      console.log(`[Relay] Test lock-all sent to ${sent} Mac(s)`);
-      sendJson(res, 200, { status: 'ok', sent });
+      sendJson(res, 200, {
+        status: 'ok',
+        online: devices.length,
+        devices,
+        relay: req.headers.host || '',
+        ts: Math.floor(Date.now() / 1000),
+      });
+    });
+    return;
+  }
+
+  // Locks every Mac currently authenticated with the relay. The Mac agent handles this
+  // frame without requiring a pairing record, which is what makes judge testing possible.
+  // The response waits briefly for each Mac's `test.lock.ack` so the panel can report
+  // whether the screen really locked.
+  if (req.method === 'POST' && url.pathname === '/api/test/lock-all') {
+    if (isTestRateLimited(clientIp)) {
+      sendJson(res, 429, { status: 'error', message: 'Too many attempts. Wait a minute and try again.' });
+      return;
+    }
+    readJsonBody(req, res, 8192, async (data) => {
+      if (!passwordMatches(data.password)) {
+        recordTestFailure(clientIp);
+        sendJson(res, 401, { status: 'error', message: 'Incorrect test password' });
+        return;
+      }
+      testAttempts.delete(clientIp);
+
+      const targets = [];
+      for (const room of rooms.values()) {
+        if (isRoomOnline(room)) targets.push(room);
+      }
+
+      const requestId = crypto.randomBytes(12).toString('base64url');
+      const waiter = {
+        expected: new Set(targets.map((room) => room.deviceId)),
+        results: new Map(),
+        timer: null,
+        resolve: null,
+      };
+      const completion = new Promise((resolve) => { waiter.resolve = resolve; });
+      waiter.timer = setTimeout(() => waiter.resolve('timeout'), TEST_LOCK_ACK_TIMEOUT_MS);
+      testLockRequests.set(requestId, waiter);
+
+      const ts = Math.floor(Date.now() / 1000);
+      let sent = 0;
+      for (const room of targets) {
+        try {
+          room.deviceSocket.send(JSON.stringify({
+            t: 'test.lock',
+            d: room.deviceId,
+            id: requestId,
+            ts,
+          }));
+          sent += 1;
+        } catch {
+          waiter.expected.delete(room.deviceId);
+        }
+      }
+      if (sent === 0) waiter.resolve('empty');
+
+      await completion;
+      clearTimeout(waiter.timer);
+      testLockRequests.delete(requestId);
+
+      const results = targets.map((room) => {
+        const ack = waiter.results.get(room.deviceId);
+        if (!ack) {
+          return { id: room.deviceId, status: sent === 0 ? 'OFFLINE' : 'NO_RESPONSE' };
+        }
+        return { id: room.deviceId, ...ack };
+      });
+      const locked = results.filter((r) => r.status === 'LOCKED' || r.status === 'ALREADY_LOCKED').length;
+      console.log(`[Relay] Test lock-all ${requestId}: sent to ${sent} Mac(s), ${locked} confirmed`);
+      sendJson(res, 200, {
+        status: 'ok',
+        sent,
+        locked,
+        failed: Math.max(0, sent - locked),
+        results,
+      });
     });
     return;
   }
@@ -453,7 +560,10 @@ function handleDeviceConnection(ws, deviceId) {
 
   // Registered first so the count is already decremented when the main close handler prunes.
   room.pending++;
-  ws.once('close', () => { room.pending--; });
+  ws.once('close', () => {
+    room.pending--;
+    pruneRoom(room);
+  });
 
   const challenge = crypto.randomBytes(32).toString('base64url');
   let authenticated = false;
@@ -519,6 +629,12 @@ function handleDeviceConnection(ws, deviceId) {
       // Step 3: Handle heartbeats
       if (data.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', ts: Math.floor(Date.now() / 1000) }));
+        return;
+      }
+
+      // Fleet-lock confirmation for the HTTP request that triggered `test.lock`.
+      if (data.t === 'test.lock.ack') {
+        noteTestLockAck(deviceId, data);
         return;
       }
 

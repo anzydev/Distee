@@ -18,10 +18,22 @@ function getRelayHttpBase(): string {
     .replace(/\/+$/, '');
 }
 
+interface TestDeviceResult {
+  id: string;
+  status: string;
+  mechanism?: string;
+  durationMs?: number | null;
+}
+
 interface TestResponse {
   status?: string;
   message?: string;
   sent?: number;
+  locked?: number;
+  failed?: number;
+  online?: number;
+  devices?: { id: string; epoch?: number }[];
+  results?: TestDeviceResult[];
 }
 
 type Stage = 'closed' | 'password' | 'panel';
@@ -140,17 +152,59 @@ const bannerStyle = (tone: 'error' | 'success'): React.CSSProperties => ({
   marginBottom: '14px',
 });
 
+const metaRowStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: '8px',
+  flexWrap: 'wrap',
+  padding: '8px 10px',
+  marginBottom: '14px',
+  borderRadius: '10px',
+  background: 'rgba(255, 255, 255, 0.04)',
+  border: '1px solid rgba(255, 255, 255, 0.07)',
+  fontSize: '11px',
+  color: '#94a3b8',
+};
+
+const resultsStyle: React.CSSProperties = {
+  marginBottom: '14px',
+  borderRadius: '10px',
+  border: '1px solid rgba(255, 255, 255, 0.08)',
+  overflow: 'hidden',
+  fontSize: '11px',
+};
+
+const resultRowStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: '8px',
+  padding: '7px 10px',
+  background: 'rgba(0, 0, 0, 0.22)',
+  borderBottom: '1px solid rgba(255, 255, 255, 0.05)',
+};
+
+function isLockedStatus(status: string): boolean {
+  return status === 'LOCKED' || status === 'ALREADY_LOCKED';
+}
+
 async function postTest(
   path: string,
   password: string
-): Promise<{ ok: boolean; httpStatus: number; data: TestResponse }> {
+): Promise<{ ok: boolean; httpStatus: number; data: TestResponse; staleRelay: boolean }> {
   const res = await fetch(`${getRelayHttpBase()}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password }),
   });
+  const contentType = res.headers.get('content-type') || '';
+  // An old relay falls through to the SPA for unknown routes and answers 200 text/html.
+  if (!contentType.includes('application/json')) {
+    return { ok: false, httpStatus: res.status, data: {}, staleRelay: true };
+  }
   const data = (await res.json().catch(() => ({}))) as TestResponse;
-  return { ok: res.ok, httpStatus: res.status, data };
+  return { ok: res.ok, httpStatus: res.status, data, staleRelay: false };
 }
 
 export const TestPanel: React.FC = () => {
@@ -160,6 +214,9 @@ export const TestPanel: React.FC = () => {
   const [locking, setLocking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
+  const [relayBase] = useState(getRelayHttpBase);
+  const [online, setOnline] = useState<number | null>(null);
+  const [results, setResults] = useState<TestDeviceResult[] | null>(null);
   // Invalidates in-flight requests when the panel is closed or reopened, so a late response
   // cannot reopen the panel or overwrite a newer attempt.
   const requestIdRef = useRef(0);
@@ -172,6 +229,8 @@ export const TestPanel: React.FC = () => {
     setLocking(false);
     setError(null);
     setResult(null);
+    setOnline(null);
+    setResults(null);
   };
 
   useEffect(() => {
@@ -190,7 +249,34 @@ export const TestPanel: React.FC = () => {
     setStage('password');
     setError(null);
     setResult(null);
+    setOnline(null);
+    setResults(null);
   };
+
+  // While the panel is open, keep showing how many Macs are attached to the relay the panel
+  // is talking to. A zero count is the quickest way to spot the panel/agent mismatch.
+  useEffect(() => {
+    if (stage !== 'panel') return;
+    let cancelled = false;
+
+    const refreshStatus = async () => {
+      try {
+        const { ok, data } = await postTest('/api/test/status', password);
+        if (!cancelled && ok && data.status === 'ok') {
+          setOnline(data.online ?? 0);
+        }
+      } catch {
+        // Polling is best-effort; the lock button still works.
+      }
+    };
+
+    void refreshStatus();
+    const interval = setInterval(refreshStatus, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [stage, password]);
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -200,9 +286,13 @@ export const TestPanel: React.FC = () => {
     setChecking(true);
     setError(null);
     try {
-      const { ok, httpStatus, data } = await postTest('/api/test/auth', password);
+      const { ok, httpStatus, data, staleRelay } = await postTest('/api/test/auth', password);
       if (requestId !== requestIdRef.current) return;
-      if (ok) {
+      if (staleRelay) {
+        setError(
+          `The relay at ${relayBase} is running an older build without the test panel. Restart it (./start.sh) or redeploy it.`
+        );
+      } else if (ok) {
         setStage('panel');
       } else if (httpStatus === 429) {
         setError('Too many attempts. Wait a minute and try again.');
@@ -211,7 +301,7 @@ export const TestPanel: React.FC = () => {
       }
     } catch {
       if (requestId === requestIdRef.current) {
-        setError('Could not reach the relay. Check your connection.');
+        setError(`Could not reach the relay at ${relayBase}. Check your connection.`);
       }
     } finally {
       if (requestId === requestIdRef.current) setChecking(false);
@@ -225,16 +315,31 @@ export const TestPanel: React.FC = () => {
     setLocking(true);
     setError(null);
     setResult(null);
+    setResults(null);
     try {
-      const { ok, httpStatus, data } = await postTest('/api/test/lock-all', password);
+      const { ok, httpStatus, data, staleRelay } = await postTest('/api/test/lock-all', password);
       if (requestId !== requestIdRef.current) return;
-      if (ok && data.status === 'ok') {
-        const sent = data.sent ?? 0;
-        setResult(
-          sent > 0
-            ? `Lock signal sent to ${sent} Mac${sent === 1 ? '' : 's'}.`
-            : 'No Macs are online right now. Make sure Distee is running on the Mac.'
+      if (staleRelay) {
+        setError(
+          `The relay at ${relayBase} is running an older build without the test panel. Restart it (./start.sh) or redeploy it.`
         );
+      } else if (ok && data.status === 'ok') {
+        const sent = data.sent ?? 0;
+        const locked = data.locked ?? 0;
+        setResults(data.results ?? null);
+        setOnline(sent);
+        if (sent === 0) {
+          setResult(
+            `No Macs are connected to this relay (${relayBase}). Start Distee against the same relay and try again.`
+          );
+        } else if (locked === sent) {
+          setResult(`Locked ${locked} of ${sent} Mac${sent === 1 ? '' : 's'}.`);
+        } else {
+          setResult(
+            `Lock signal sent to ${sent} Mac${sent === 1 ? '' : 's'}; ${locked} confirmed locked. ` +
+              'Check that Distee has Accessibility permission (or "require password immediately" for display sleep).'
+          );
+        }
       } else if (httpStatus === 401) {
         setStage('password');
         setError('Session rejected. Enter the test password again.');
@@ -245,7 +350,7 @@ export const TestPanel: React.FC = () => {
       }
     } catch {
       if (requestId === requestIdRef.current) {
-        setError('Could not reach the relay. Check your connection.');
+        setError(`Could not reach the relay at ${relayBase}. Check your connection.`);
       }
     } finally {
       if (requestId === requestIdRef.current) setLocking(false);
@@ -339,9 +444,24 @@ export const TestPanel: React.FC = () => {
                   <div style={{ fontSize: '18px', fontWeight: 600 }}>Test mode</div>
                 </div>
 
-                <p style={{ margin: '0 0 18px', fontSize: '13px', lineHeight: 1.5, color: '#94a3b8' }}>
+                <p style={{ margin: '0 0 14px', fontSize: '13px', lineHeight: 1.5, color: '#94a3b8' }}>
                   Locks every Mac currently connected to the relay. No pairing is required.
                 </p>
+
+                <div style={metaRowStyle}>
+                  <span style={{ wordBreak: 'break-all' }}>{relayBase}</span>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', whiteSpace: 'nowrap' }}>
+                    <span
+                      style={{
+                        width: '7px',
+                        height: '7px',
+                        borderRadius: '50%',
+                        background: online === null ? '#94a3b8' : online > 0 ? '#4ade80' : '#f87171',
+                      }}
+                    />
+                    {online === null ? 'Checking…' : `${online} Mac${online === 1 ? '' : 's'} online`}
+                  </span>
+                </div>
 
                 {error && (
                   <div style={bannerStyle('error')}>
@@ -354,6 +474,29 @@ export const TestPanel: React.FC = () => {
                   <div style={bannerStyle('success')}>
                     <CheckCircle2 size={16} style={{ flexShrink: 0, marginTop: '1px' }} />
                     <span>{result}</span>
+                  </div>
+                )}
+
+                {results && results.length > 0 && (
+                  <div style={resultsStyle}>
+                    {results.map((device, index) => (
+                      <div
+                        key={device.id}
+                        style={{
+                          ...resultRowStyle,
+                          borderBottom:
+                            index === results.length - 1 ? 'none' : '1px solid rgba(255, 255, 255, 0.05)',
+                        }}
+                      >
+                        <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                          {device.id}
+                        </span>
+                        <span style={{ color: isLockedStatus(device.status) ? '#86efac' : '#fca5a5' }}>
+                          {device.status}
+                          {device.mechanism && device.mechanism !== 'none' ? ` · ${device.mechanism}` : ''}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 )}
 

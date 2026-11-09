@@ -214,6 +214,46 @@ enum RemoteLockTests {
             suite.expect(fixture.store.load() == nil, "pairing record removed")
             suite.expectEqual(fixture.store.currentEpoch, 2, "epoch advanced on unpair")
         }
+
+        await suite.run("fleetlock.test.lock locks with no signed envelope and acks the relay") {
+            let fixture = try CommandFixture()
+            defer { fixture.tearDown() }
+
+            let requestId = "req-\(UUID().uuidString)"
+            let frame: [String: Any] = [
+                "t": "test.lock",
+                "d": fixture.identity.deviceId,
+                "id": requestId,
+            ]
+            fixture.service.receiveFrame(try JSONSerialization.data(withJSONObject: frame))
+
+            let ack = await fixture.wait(forType: "test.lock.ack")
+            suite.expect(ack != nil, "fleet lock must be acknowledged")
+            guard let ack else { return }
+            suite.expectEqual(ack["id"] as? String, requestId, "ack echoes the request id")
+            suite.expectEqual(ack["d"] as? String, fixture.identity.deviceId)
+            suite.expectEqual(ack["status"] as? String, "LOCKED")
+            suite.expectEqual(fixture.poster.posts, 1, "fleet lock runs the real lock path once")
+        }
+
+        await suite.run("fleetlock.test.lock addressed to another device is ignored") {
+            let fixture = try CommandFixture()
+            defer { fixture.tearDown() }
+
+            let frame: [String: Any] = [
+                "t": "test.lock",
+                "d": "aaaaaaaaaaaaaaaa",
+                "id": "req-other-device",
+            ]
+            fixture.service.receiveFrame(try JSONSerialization.data(withJSONObject: frame))
+            try? await Task.sleep(nanoseconds: 200_000_000)
+
+            suite.expectEqual(fixture.poster.posts, 0, "must not lock for another device")
+            suite.expect(
+                fixture.frames.allSatisfy { ($0["t"] as? String) != "test.lock.ack" },
+                "no ack for a frame addressed elsewhere"
+            )
+        }
     }
 }
 
