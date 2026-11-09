@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { AlertCircle, CheckCircle2, FlaskConical, Loader2, Lock, ShieldCheck, X } from 'lucide-react';
-import { getRelayUrl } from '../storage/storage';
 
 /**
  * Hackathon test panel.
@@ -18,8 +17,17 @@ function wsToHttp(base: string): string {
     .replace(/\/+$/, '');
 }
 
+/**
+ * The relay serving this page. Using the page origin (rather than the phone's stored pairing
+ * relay) keeps the panel pointed at the relay it was actually loaded from, even after a
+ * trycloudflare tunnel restart changes the URL.
+ */
 function getRelayHttpBase(): string {
-  return wsToHttp(getRelayUrl());
+  if (window.location.port === '5173') {
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    return `${protocol}//${window.location.hostname}:8799`;
+  }
+  return window.location.origin;
 }
 
 function hostLabel(base: string): string {
