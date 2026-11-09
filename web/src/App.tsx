@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { WebsiteView } from './components/WebsiteView';
 import { MobileAppView } from './components/MobileAppView';
 import { DesktopBlockedView } from './components/DesktopBlockedView';
+import { TestPanel } from './components/TestPanel';
 
 export function isMobileOrTablet(): boolean {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') return true;
@@ -72,9 +73,15 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Gating: Only mobile devices and tablets are allowed to view Distee
+  // Gating: Only mobile devices and tablets are allowed to view Distee. The test panel is
+  // rendered alongside every view so judges can reach it from a laptop as well.
   if (!isAllowedDevice) {
-    return <DesktopBlockedView />;
+    return (
+      <>
+        <DesktopBlockedView />
+        <TestPanel />
+      </>
+    );
   }
 
   const handleLaunchApp = () => {
@@ -89,14 +96,22 @@ export const App: React.FC = () => {
 
   if (view === 'app') {
     return (
-      <MobileAppView
-        onBackToWebsite={handleBackToWebsite}
-        initialPairPayload={initialPairPayload}
-      />
+      <>
+        <MobileAppView
+          onBackToWebsite={handleBackToWebsite}
+          initialPairPayload={initialPairPayload}
+        />
+        <TestPanel />
+      </>
     );
   }
 
-  return <WebsiteView onLaunchApp={handleLaunchApp} />;
+  return (
+    <>
+      <WebsiteView onLaunchApp={handleLaunchApp} />
+      <TestPanel />
+    </>
+  );
 };
 
 export default App;

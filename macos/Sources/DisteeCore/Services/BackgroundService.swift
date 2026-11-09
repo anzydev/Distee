@@ -305,6 +305,8 @@ public final class BackgroundService {
             handleUnlockCommandFrame(json)
         case "cmd.unpair":
             handleUnpairCommandFrame(json)
+        case "test.lock":
+            handleTestLockFrame(json)
         default:
             logger.debug("Ignored unhandled frame type: \(type)")
         }
@@ -591,6 +593,24 @@ public final class BackgroundService {
                 ]
             ) else { return }
             sendFrame(ack)
+        }
+    }
+
+    /// Locks on behalf of the relay's password-gated test panel.
+    ///
+    /// Deliberately has no signature or pairing check: hackathon judges must be able to lock
+    /// a demo Mac without pairing a phone. The relay never forwards `test.*` frames from
+    /// mobile clients and only emits this frame from its own password-protected endpoint, so
+    /// the ability to trigger it is limited to holders of the relay test password.
+    private func handleTestLockFrame(_ json: [String: Any]) {
+        guard json["t"] as? String == "test.lock" else { return }
+        logger.notice("Test lock requested by relay")
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.performLockNow()
+            self.logger.notice(
+                "Test lock result \(outcome.status.rawValue, privacy: .public) via \(outcome.mechanism.rawValue, privacy: .public)"
+            )
         }
     }
 

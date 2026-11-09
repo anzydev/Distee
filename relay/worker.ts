@@ -244,6 +244,18 @@ export class DeviceRoom implements DurableObject {
           ws.send(JSON.stringify({ t: 'pong', ts: Math.floor(Date.now() / 1000) }));
           return;
         }
+        // Test frames are only emitted by the Node relay's password-gated admin endpoint.
+        // Without this check a phone could lock a Mac with no pairing at all.
+        if (typeof data.t === 'string' && data.t.startsWith('test.')) {
+          ws.send(JSON.stringify({
+            t: 'error',
+            code: 'FORBIDDEN',
+            message: 'Test frames are relay-only',
+            d: this.deviceId,
+            ts: Math.floor(Date.now() / 1000),
+          }));
+          return;
+        }
         // Only forward to a Mac that has proven its identity.
         if (this.deviceWs && this.authenticated) {
           this.deviceWs.send(JSON.stringify(data));

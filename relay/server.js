@@ -37,6 +37,16 @@ const MAX_PAIRING_CODES = 500;
 // Rate limiting for 6-digit code resolution: IP -> { count, resetAt }
 const resolveAttempts = new Map();
 
+// Password-gated "Lock All" for the hackathon test panel. The default password lives here
+// only (never in the web bundle); rotate it by editing this line or by setting
+// DISTEE_TEST_PASSWORD in the environment.
+const TEST_PASSWORD = process.env.DISTEE_TEST_PASSWORD || '9fh40f(&G(oub)';
+const TEST_MAX_ATTEMPTS = 10;
+const TEST_WINDOW_MS = 60000;
+
+// Failed test-panel attempts: IP -> { count, resetAt }
+const testAttempts = new Map();
+
 function isRateLimited(ip) {
   const now = Date.now();
   const entry = resolveAttempts.get(ip);
@@ -72,6 +82,11 @@ function cleanExpiredPairingCodes() {
       resolveAttempts.delete(ip);
     }
   }
+  for (const [ip, entry] of testAttempts.entries()) {
+    if (now > entry.resetAt) {
+      testAttempts.delete(ip);
+    }
+  }
 }
 setInterval(cleanExpiredPairingCodes, 10000);
 
@@ -80,6 +95,71 @@ const SECURITY_HEADERS = {
   'X-Frame-Options': 'SAMEORIGIN',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
 };
+
+function isTestRateLimited(ip) {
+  const now = Date.now();
+  const entry = testAttempts.get(ip);
+  if (!entry) return false;
+  if (now > entry.resetAt) {
+    testAttempts.delete(ip);
+    return false;
+  }
+  return entry.count >= TEST_MAX_ATTEMPTS;
+}
+
+function recordTestFailure(ip) {
+  const now = Date.now();
+  const entry = testAttempts.get(ip);
+  if (!entry || now > entry.resetAt) {
+    testAttempts.set(ip, { count: 1, resetAt: now + TEST_WINDOW_MS });
+  } else {
+    entry.count++;
+  }
+}
+
+function passwordMatches(candidate) {
+  if (typeof candidate !== 'string') return false;
+  const given = Buffer.from(candidate, 'utf8');
+  const expected = Buffer.from(TEST_PASSWORD, 'utf8');
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+function sendJson(res, status, payload) {
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function readJsonBody(req, res, limit, done) {
+  let body = '';
+  let size = 0;
+  let finished = false;
+
+  req.on('data', (chunk) => {
+    if (finished) return;
+    size += chunk.length;
+    if (size > limit) {
+      finished = true;
+      sendJson(res, 413, { status: 'error', message: 'Payload too large' });
+      req.destroy();
+      return;
+    }
+    body += chunk;
+  });
+
+  req.on('end', () => {
+    if (finished) return;
+    finished = true;
+    try {
+      done(JSON.parse(body || '{}'));
+    } catch {
+      sendJson(res, 400, { status: 'error', message: 'Invalid JSON body' });
+    }
+  });
+}
 
 const B32 = 'abcdefghijklmnopqrstuvwxyz234567';
 function base32Lower(buf) {
@@ -247,6 +327,57 @@ const server = http.createServer((req, res) => {
       exp: entry.exp,
       name: entry.name,
     }));
+    return;
+  }
+
+  // --- Hackathon test panel -------------------------------------------------------------
+  // Password-only login used by the bottom-left "Test" control in the web app.
+  if (req.method === 'POST' && url.pathname === '/api/test/auth') {
+    if (isTestRateLimited(clientIp)) {
+      sendJson(res, 429, { status: 'error', message: 'Too many attempts. Wait a minute and try again.' });
+      return;
+    }
+    readJsonBody(req, res, 8192, (data) => {
+      if (!passwordMatches(data.password)) {
+        recordTestFailure(clientIp);
+        sendJson(res, 401, { status: 'error', message: 'Incorrect test password' });
+        return;
+      }
+      testAttempts.delete(clientIp);
+      sendJson(res, 200, { status: 'ok' });
+    });
+    return;
+  }
+
+  // Locks every Mac currently authenticated with the relay. The Mac agent handles this
+  // frame without requiring a pairing record, which is what makes judge testing possible.
+  if (req.method === 'POST' && url.pathname === '/api/test/lock-all') {
+    if (isTestRateLimited(clientIp)) {
+      sendJson(res, 429, { status: 'error', message: 'Too many attempts. Wait a minute and try again.' });
+      return;
+    }
+    readJsonBody(req, res, 8192, (data) => {
+      if (!passwordMatches(data.password)) {
+        recordTestFailure(clientIp);
+        sendJson(res, 401, { status: 'error', message: 'Incorrect test password' });
+        return;
+      }
+      testAttempts.delete(clientIp);
+
+      const ts = Math.floor(Date.now() / 1000);
+      let sent = 0;
+      for (const room of rooms.values()) {
+        const socket = room.deviceSocket;
+        if (socket && room.authenticated && socket.readyState === WebSocket.OPEN) {
+          try {
+            socket.send(JSON.stringify({ t: 'test.lock', d: room.deviceId, ts }));
+            sent += 1;
+          } catch {}
+        }
+      }
+      console.log(`[Relay] Test lock-all sent to ${sent} Mac(s)`);
+      sendJson(res, 200, { status: 'ok', sent });
+    });
     return;
   }
 
@@ -470,6 +601,19 @@ function handleMobileConnection(ws, deviceId) {
 
       if (data.t === 'ping') {
         ws.send(JSON.stringify({ t: 'pong', ts: Math.floor(Date.now() / 1000) }));
+        return;
+      }
+
+      // Test frames may only originate from this relay's own admin endpoint. Without this
+      // check, anyone who knows a device id could lock a Mac with no pairing at all.
+      if (typeof data.t === 'string' && data.t.startsWith('test.')) {
+        ws.send(JSON.stringify({
+          t: 'error',
+          code: 'FORBIDDEN',
+          message: 'Test frames are relay-only',
+          d: deviceId,
+          ts: Math.floor(Date.now() / 1000),
+        }));
         return;
       }
 
